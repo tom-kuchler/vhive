@@ -36,7 +36,8 @@ import cv2
 import grpc
 import tempfile
 import argparse
-import ffmpeg
+import asyncio
+
 
 from concurrent import futures
 from timeit import default_timer as now
@@ -62,55 +63,42 @@ def decode(bytes):
         temp.write(bytes)
         temp.seek(0)
         end_tempfile_write = now()
-        write_time = (start_tempfile-end_tempfile_write)*1000
+        write_time = (end_tempfile_write - start_tempfile)*1000
         print("tempfile write time: %dms" %write_time)
 
-    start_decode = now()
-    with tracing.Span("get frames"):
-        out = []
-        count = 0
+    all_frames = [] 
+    with tracing.Span("Get frames"):
+        vidcap = cv2.VideoCapture(temp.name)
         for i in range(os.getenv('DecoderFrames', int(args.frames))):
-            frame, _ = (
-                ffmpeg
-                .input(temp.name)
-                .filter('select', 'gte(n,{})'.format(i+1))
-                .output('pipe:', vframes=1, format='image2', vcodec='mjpeg')
-                .run(capture_stdout=True)
-            )
-            out.append(frame)
+            success,image = vidcap.read()
+            all_frames.append(cv2.imencode('.jpg', image)[1].tobytes())
 
-    end_decode = now()
-
-    decode_e2e = ( end_decode - start_decode ) * 1000
-    print('Time to decode %d frames: %dms' % (count, decode_e2e))
-    temp.close()
-    return out
+    return all_frames
 
 
 
-class DecodeVideoServicer(videoservice_pb2_grpc.DecodeVideoServicer):
-    def SendVideo(self, request, context):
-        out = decode(request.value)
+class VideoDecoderServicer(videoservice_pb2_grpc.VideoDecoderServicer):
+    def Decode(self, request, context):
+        out = decode(request.video)
         with tracing.Span("Send all frames"):  
             for i in range(os.getenv('DecoderFrames', int(args.frames))):
-                print("SENDING FRAME %d" %i)
-                result = self.SendFrame(out[i])
+                result = self.Recognise(out[i])
                 print(result)
         # just returns the final result
-        return videoservice_pb2.SendVideoReply(value=result)
+        return videoservice_pb2.DecodeReply(classification=result)
     
-    def SendFrame(self, frame):
+    def Recognise(self, frame):
         channel = grpc.insecure_channel(args.addr)
-        stub = videoservice_pb2_grpc.ProcessFrameStub(channel)
-        response = stub.SendFrame(videoservice_pb2.SendFrameRequest(value=frame))
-        return response.value
+        stub = videoservice_pb2_grpc.ObjectRecognitionStub(channel)
+        response = stub.Recognise(videoservice_pb2.RecogniseRequest(frame=frame))
+        return response.classification
 
 
 
 def serve():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    videoservice_pb2_grpc.add_DecodeVideoServicer_to_server(
-        DecodeVideoServicer(), server)
+    videoservice_pb2_grpc.add_VideoDecoderServicer_to_server(
+        VideoDecoderServicer(), server)
     server.add_insecure_port('[::]:'+args.sp)
     server.start()
     server.wait_for_termination()
